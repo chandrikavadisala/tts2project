@@ -1,0 +1,37 @@
+# project/English/config.yaml (or project/Telugu/config.yaml)
+path:
+  dataset_path: "path/to/raw_dataset"
+  preprocessed_path: "./preprocessed_data"
+  checkpoint_path: "./checkpoints"
+  result_path: "../Results"
+
+audio:
+  sampling_rate: 22050       # Hz — target sample rate; source audio is resampled to this if needed
+  max_wav_value: 32768.0     # Normalisation divisor for int16 WAV (2^15); change to 2147483648.0 for int32
+  filter_length: 1024        # STFT FFT size (n_fft); must be a power of 2
+  hop_length: 256            # STFT hop size in samples; frame_shift = hop_length / sampling_rate seconds
+  win_length: 1024           # STFT window length in samples; equal to filter_length (no zero-padding)
+  n_mel_channels: 80         # Number of Mel filterbank channels
+  mel_fmin: 80.0             # Mel filterbank lower bound (Hz); 80 Hz excludes sub-bass noise for TTS
+  mel_fmax: 8000.0           # Mel filterbank upper bound (Hz); Nyquist = sampling_rate / 2 = 11025
+
+model:
+  encoder_layer: 4
+  encoder_head: 2
+  encoder_hidden: 256
+  decoder_layer: 4
+  decoder_head: 2
+  decoder_hidden: 256
+  fft_conv1d_filter_size: 1024
+  fft_conv1d_kernel_size: [9, 1]
+  variance_predictor_filter_size: 256
+  variance_predictor_kernel_size: 3
+  dropout: 0.1
+
+train:
+  batch_size: 16
+  epochs: 1000
+  learning_rate: 0.001
+  weight_decay: 0.000001
+  grad_clip_thresh: 1.0
+  save_step: 2000

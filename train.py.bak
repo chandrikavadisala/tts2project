@@ -1,0 +1,153 @@
+﻿import os
+import yaml
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import matplotlib.pyplot as plt
+
+class FastSpeech2Dataset(Dataset):
+    def __init__(self, base_dir):
+        self.base_dir = base_dir
+        self.seq_dir = os.path.join(base_dir, "seq")
+        self.file_ids = [f.split('.')[0] for f in os.listdir(self.seq_dir) if f.endswith('.npy')]
+
+    def __len__(self):
+        return len(self.file_ids)
+
+    def __getitem__(self, idx):
+        fid = self.file_ids[idx]
+        return {
+            "seq": torch.from_numpy(np.load(os.path.join(self.base_dir, "seq", f"{fid}.npy"))).long(),
+            Try changing it to:
+            "seq": torch.from_numpy(np.load(os.path.join(self.base_dir,"seq",f"{fid}.npy"),allow_pickle=True)).long(),         
+            "mel": torch.from_numpy(np.load(os.path.join(self.base_dir, "mel", f"{fid}.npy"))).float(),
+            "f0": torch.from_numpy(np.load(os.path.join(self.base_dir, "f0", f"{fid}.npy"))).float(),
+            "energy": torch.from_numpy(np.load(os.path.join(self.base_dir, "energy", f"{fid}.npy"))).float(),
+            "duration": torch.from_numpy(np.load(os.path.join(self.base_dir, "duration", f"{fid}.npy"))).long(),
+        }
+
+def pad_tensor(vec, max_len, dim=0, pad_value=0):
+    pad_size = list(vec.shape)
+    if pad_size[dim] >= max_len:
+        return vec
+    pad_size[dim] = max_len - pad_size[dim]
+    return torch.cat([vec, torch.ones(*pad_size, dtype=vec.dtype, device=vec.device) * pad_value], dim=dim)
+
+def collate_fn(batch):
+    max_seq_len = max([x['seq'].shape[0] for x in batch])
+    max_mel_len = max([x['mel'].shape[0] for x in batch])
+    
+    seqs, mels, f0s, energies, durations = [], [], [], [], []
+    for item in batch:
+        seqs.append(pad_tensor(item['seq'], max_seq_len, dim=0, pad_value=0))
+        durations.append(pad_tensor(item['duration'], max_seq_len, dim=0, pad_value=0))
+        mels.append(pad_tensor(item['mel'], max_mel_len, dim=0, pad_value=0))
+        f0s.append(pad_tensor(item['f0'], max_mel_len, dim=0, pad_value=0))
+        energies.append(pad_tensor(item['energy'], max_mel_len, dim=0, pad_value=0))
+
+    return {
+        "seq": torch.stack(seqs), "mel": torch.stack(mels),
+        "f0": torch.stack(f0s), "energy": torch.stack(energies), "duration": torch.stack(durations)
+    }
+
+class VariancePredictor(nn.Module):
+    def __init__(self, dim, filter_size, kernel_size, dropout):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv1d(dim, filter_size, kernel_size, padding=(kernel_size - 1) // 2),
+            nn.ReLU(), nn.LayerNorm(filter_size), nn.Dropout(dropout),
+            nn.Conv1d(filter_size, filter_size, kernel_size, padding=(kernel_size - 1) // 2),
+            nn.ReLU(), nn.LayerNorm(filter_size), nn.Dropout(dropout),
+            nn.Conv1d(filter_size, 1, 1)
+        )
+    def forward(self, x):
+        return self.layers(x.transpose(1, 2)).squeeze(1)
+
+class FastSpeech2(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        m = config["model"]
+        self.encoder = nn.Embedding(m["vocab_size"], m["encoder_dim"])
+        self.dur_pred = VariancePredictor(m["encoder_dim"], m["variance_predictor_filter_size"], m["variance_predictor_kernel_size"], m["dropout"])
+        self.pitch_pred = VariancePredictor(m["encoder_dim"], m["variance_predictor_filter_size"], m["variance_predictor_kernel_size"], m["dropout"])
+        self.energy_pred = VariancePredictor(m["encoder_dim"], m["variance_predictor_filter_size"], m["variance_predictor_kernel_size"], m["dropout"])
+        
+        self.pitch_embed = nn.Linear(1, m["encoder_dim"])
+        self.energy_embed = nn.Linear(1, m["encoder_dim"])
+        self.decoder = nn.Linear(m["encoder_dim"], config["dataset"]["n_mels"])
+
+    def forward(self, seq, target_dur=None, target_f0=None, target_energy=None):
+        x = self.encoder(seq)
+        p_dur = self.dur_pred(x)
+        
+        if target_dur is not None:
+            # Length Regulator implementation mapping phone tokens to frame blocks
+            p_f0 = self.pitch_pred(x)
+            p_energy = self.energy_pred(x)
+            
+            # Map embedded target dimensions
+            f0_emb = self.pitch_embed(target_f0.unsqueeze(-1))
+            energy_emb = self.energy_embed(target_energy.unsqueeze(-1))
+            
+            # Sequence alignment interpolation
+            rep_list = []
+            for i, d in enumerate(target_dur):
+                rep_list.append(torch.repeat_interleave(x[i], d, dim=0))
+            
+            # Fallback boundary clamp protection
+            x_aligned = nn.utils.rnn.pad_sequence(rep_list, batch_first=True)
+            min_frames = min(x_aligned.shape[1], f0_emb.shape[1])
+            
+            x_final = x_aligned[:, :min_frames, :] + f0_emb[:, :min_frames, :] + energy_emb[:, :min_frames, :]
+            mel_out = self.decoder(x_final)
+            return mel_out, p_dur, p_f0, p_energy
+        else:
+            # Inference logic deployment via predicted inputs
+            dur_exec = torch.clamp(torch.round(torch.exp(p_dur) - 1), min=0).long()
+            rep_list = []
+            for i, d in enumerate(dur_exec):
+                rep_list.append(torch.repeat_interleave(x[i], d, dim=0))
+            x_aligned = nn.utils.rnn.pad_sequence(rep_list, batch_first=True)
+            return self.decoder(x_aligned), p_dur, None, None
+
+def main():
+    with open("config.yaml", "r") as f:
+        config = yaml.safe_load(f)
+    os.makedirs(config["path"]["checkpoint_path"], exist_ok=True)
+    
+    dataset = FastSpeech2Dataset(config["path"]["dataset_path"])
+    loader = DataLoader(dataset, batch_size=config["train"]["batch_size"], shuffle=True, collate_fn=collate_fn)
+    
+    model = FastSpeech2(config).cuda()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["train"]["learning_rate"])
+    criterion = nn.MSELoss()
+    
+    history = []
+    for epoch in range(config["train"]["epochs"]):
+        model.train()
+        total_loss = 0
+        for batch in loader:
+            optimizer.zero_grad()
+            seq, mel, f0, energy, dur = batch["seq"].cuda(), batch["mel"].cuda(), batch["f0"].cuda(), batch["energy"].cuda(), batch["duration"].cuda()
+            
+            mel_p, dur_p, f0_p, energy_p = model(seq, dur, f0, energy)
+            
+            min_f = min(mel.shape[1], mel_p.shape[1])
+            loss = criterion(mel_p[:, :min_f, :], mel[:, :min_f, :]) + criterion(dur_p, dur.float())
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            
+        history.append(total_loss / len(loader))
+        print(f"Epoch {epoch+1} | Aggregated Batch Mean MSE Loss: {history[-1]:.4f}")
+        
+    torch.save(model.state_dict(), os.path.join(config["path"]["checkpoint_path"], "best_model.pth"))
+    
+    # Save Loss Graph Plot
+    plt.plot(history)
+    plt.title("Model Convergence Sequence")
+    plt.savefig(f"../Results/{'English' if config['dataset']['language']=='en' else 'Telugu'}/training_loss.png")
+
+if __name__ == "__main__":
+    main()

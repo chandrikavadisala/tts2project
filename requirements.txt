@@ -1,0 +1,12 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.22.0
+scipy>=1.8.0
+pyyaml>=6.0
+matplotlib>=3.5.0
+librosa>=0.9.0
+tgt>=1.4.4
+phonemizer>=3.2.1
+indic-nlp-library>=0.81
+inflect>=7.0.0
+nltk>=3.8.0
